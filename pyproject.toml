@@ -10,6 +10,7 @@ requires-python = ">=3.11,<4"
 dependencies = [
     "azure-identity>=1.15.0",
     "msgraph-sdk>=1.54.0,<2.0.0",
+    "pydantic-settings>=2.1.0",
     "ruff (>=0.15.0,<0.16.0)",
 ]
 
@@ -21,6 +22,9 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.poetry]
+package-mode = false
 
 [tool.poetry.group.dev.dependencies]
 ipython = "^9.10.0"

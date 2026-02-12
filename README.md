@@ -29,13 +29,15 @@ The setup script will:
 ### 3. Use the Client
 
 ```python
-import os
 from azure.identity import DeviceCodeCredential
 from src.onedrive import OneDriveClient
+from src.settings import get_settings
+
+settings = get_settings()
 
 credential = DeviceCodeCredential(
-    client_id=os.environ["AZURE_CLIENT_ID"],
-    tenant_id=os.environ["AZURE_TENANT_ID"],
+    client_id=settings.azure_client_id,
+    tenant_id=settings.azure_tenant_id,
 )
 
 client = OneDriveClient(credential=credential)

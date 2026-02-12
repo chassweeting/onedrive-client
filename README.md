@@ -124,10 +124,19 @@ The `--api-permissions` flag uses permission-specific GUIDs:
 
 ### Delegated vs Application Permissions
 
-- `=Scope` = **Delegated** - runs as the signed-in user, user consent required
-- `=Role` = **Application** - runs as the app itself, admin consent required
+| | Delegated (`=Scope`) | Application (`=Role`) |
+|---|---|---|
+| **How it runs** | As the signed-in user | As the app itself (no user) |
+| **User sign-in** | Required | Not needed |
+| **Consent** | User or admin | Admin only |
+| **Access scope** | Only what the user can access | Entire tenant |
+| **Use case** | Web apps, mobile apps, CLI tools | Background services, daemons |
 
-For interactive use (IPython, desktop apps), use **delegated** permissions.
+**Delegated permissions** - The app acts on behalf of a signed-in user. It can only access what that user has access to. This is what you want for interactive use.
+
+**Application permissions** - The app runs as itself with no user context. It has access to *all* resources of that type (e.g., all users' files). Requires admin consent and should be used carefully.
+
+This client uses **delegated** permissions since it's designed for interactive use with device code flow.
 
 ### Discovering Permission GUIDs
 
@@ -169,3 +178,30 @@ You tried to run `az ad app permission admin-consent` without admin rights. This
 Your account doesn't have OneDrive provisioned. Try:
 1. Visit https://portal.office.com and click OneDrive to trigger provisioning
 2. Or use SharePoint sites instead: `await client.list_followed_sites()`
+
+### "Device is not compliant"
+
+This is a **Conditional Access Policy** enforced by your Azure AD tenant — the admin requires devices accessing Graph API to be Intune-managed (or meet other compliance requirements). Your app registration and permissions are fine; this is an IT security policy.
+
+**Options:**
+
+1. **Use a managed device** — If you have access to an Intune-enrolled corporate device, run from there
+
+2. **Use a different tenant** — Create a free Azure AD tenant or use a personal Microsoft account for testing
+
+3. **Ask IT to exclude your app** — Contact your Azure AD admin to exclude your app from the Conditional Access policy (they may be reluctant to do this)
+
+4. **Use Application permissions instead** — Service principal with client secret bypasses user auth, but requires admin consent and grants broad access:
+   ```bash
+   # Create a client secret
+   az ad app credential reset --id $APP_ID --append
+   
+   # Add Application (not Delegated) permissions
+   az ad app permission add --id $APP_ID \
+     --api 00000003-0000-0000-c000-000000000000 \
+     --api-permissions df85f4d6-205c-4ac5-a5ea-6bf408dba283=Role
+   
+   # Grant admin consent (requires admin)
+   az ad app permission admin-consent --id $APP_ID
+   ```
+   Then use `ClientSecretCredential` instead of `DeviceCodeCredential`.

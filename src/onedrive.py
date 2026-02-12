@@ -1,0 +1,446 @@
+"""OneDrive client for interacting with Microsoft Graph API.
+
+Provides a typed interface for CRUD operations on files and folders
+in OneDrive / SharePoint document libraries via the Microsoft Graph SDK.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from azure.identity.aio import DefaultAzureCredential
+from msgraph import GraphServiceClient
+from msgraph.generated.models.drive_item import DriveItem
+from msgraph.generated.models.folder import Folder
+
+
+if TYPE_CHECKING:
+    from datetime import datetime
+
+
+@dataclass(frozen=True)
+class DriveItemInfo:
+    """Represents metadata about a file or folder in OneDrive."""
+
+    id: str
+    name: str
+    size: int | None = None
+    mime_type: str | None = None
+    is_folder: bool = False
+    created_at: datetime | None = None
+    modified_at: datetime | None = None
+    web_url: str | None = None
+    download_url: str | None = None
+
+    @property
+    def is_file(self) -> bool:
+        """Return True if this item is a file."""
+        return not self.is_folder
+
+
+@dataclass(frozen=True)
+class FolderInfo:
+    """Represents metadata about a folder including its children."""
+
+    id: str
+    name: str
+    children: list[DriveItemInfo]
+    web_url: str | None = None
+
+
+@dataclass(frozen=True)
+class SiteInfo:
+    """Represents metadata about a SharePoint site."""
+
+    id: str
+    name: str
+    display_name: str
+    web_url: str | None = None
+
+
+if TYPE_CHECKING:
+    from azure.core.credentials import TokenCredential
+    from azure.core.credentials_async import AsyncTokenCredential
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_SCOPES: list[str] = ["https://graph.microsoft.com/.default"]
+
+
+def _to_drive_item_info(item: DriveItem) -> DriveItemInfo:
+    """Convert a Graph SDK ``DriveItem`` to our ``DriveItemInfo`` model."""
+    return DriveItemInfo(
+        id=item.id or "",
+        name=item.name or "",
+        size=item.size,
+        mime_type=item.file.mime_type if item.file else None,
+        is_folder=item.folder is not None,
+        created_at=item.created_date_time,
+        modified_at=item.last_modified_date_time,
+        web_url=item.web_url,
+        download_url=item.additional_data.get("@microsoft.graph.downloadUrl"),
+    )
+
+
+class OneDriveClient:
+    """High-level client for OneDrive / SharePoint file operations.
+
+    Parameters
+    ----------
+    credential:
+        An ``azure-identity`` credential that implements ``TokenCredential``.
+    scopes:
+        OAuth 2.0 scopes.  Defaults to ``["https://graph.microsoft.com/.default"]``
+        which is suitable for application-permission flows.
+    graph_client:
+        Optional pre-configured ``GraphServiceClient``.  When provided the
+        *credential* and *scopes* arguments are ignored.  This is useful for
+        testing and for advanced scenarios where the caller wants full control
+        over the HTTP pipeline.
+    """
+
+    def __init__(
+        self,
+        credential: TokenCredential | AsyncTokenCredential | None = None,
+        scopes: list[str] | None = None,
+        *,
+        graph_client: GraphServiceClient | None = None,
+    ) -> None:
+        if graph_client is not None:
+            self._client = graph_client
+        elif credential is not None:
+            self._client = GraphServiceClient(
+                credentials=credential,
+                scopes=scopes or _DEFAULT_SCOPES,
+            )
+        else:
+            msg = "Either 'credential' or 'graph_client' must be provided."
+            raise ValueError(msg)
+
+    async def get_user_display_name(self) -> str:
+        """Return the authenticated user's display name from Microsoft Graph."""
+        user = await self._client.me.get()
+        if user is None or user.display_name is None:
+            return "User"
+        return user.display_name
+
+    async def get_my_drive_id(self) -> str:
+        """Get the drive ID of the authenticated user's OneDrive."""
+        drive = await self._client.me.drive.get()
+        if drive is None or drive.id is None:
+            msg = "Could not resolve the current user's OneDrive drive ID."
+            raise FileNotFoundError(msg)
+        return drive.id
+
+    async def list_followed_sites(self) -> list[SiteInfo]:
+        """Return the SharePoint sites the current user is following."""
+        result = await self._client.me.followed_sites.get()
+        if result is None or result.value is None:
+            return []
+        return [
+            SiteInfo(
+                id=site.id or "",
+                name=site.name or "",
+                display_name=site.display_name or site.name or "",
+                web_url=site.web_url,
+            )
+            for site in result.value
+        ]
+
+    async def get_site_default_drive_id(self, site_id: str) -> str:
+        """Resolve the default document-library drive ID for a site by ID.
+
+        Parameters
+        ----------
+        site_id:
+            The site identifier (e.g. ``"contoso.sharepoint.com,guid,guid"``).
+        """
+        drive = await self._client.sites.by_site_id(site_id).drive.get()
+        if drive is None or drive.id is None:
+            msg = f"Default drive not found for site {site_id}"
+            raise FileNotFoundError(msg)
+        return drive.id
+
+    async def get_site_drive_id(self, hostname: str, site_path: str) -> str:
+        """Resolve the default document-library drive ID for a SharePoint site.
+
+        Parameters
+        ----------
+        hostname:
+            e.g. ``"contoso.sharepoint.com"``
+        site_path:
+            Server-relative path, e.g. ``"/sites/my-team"``
+        """
+        site = await self._client.sites.by_site_id(f"{hostname}:{site_path}").get()
+        if site is None:
+            msg = f"Site not found: {hostname}:{site_path}"
+            raise FileNotFoundError(msg)
+
+        drive = await self._client.sites.by_site_id(site.id or "").drive.get()
+        if drive is None:
+            msg = f"Default drive not found for site {hostname}:{site_path}"
+            raise FileNotFoundError(msg)
+        return drive.id or ""
+
+    async def list_items(
+        self, drive_id: str, folder_id: str = "root"
+    ) -> list[DriveItemInfo]:
+        """List immediate children of a folder in a drive.
+
+        Parameters
+        ----------
+        drive_id:
+            The drive (document library) identifier.
+        folder_id:
+            The item ID of the folder.  Use ``"root"`` for the drive root.
+        """
+        result = await (
+            self._client.drives.by_drive_id(drive_id)
+            .items.by_drive_item_id(folder_id)
+            .children.get()
+        )
+        if result is None or result.value is None:
+            return []
+        return [_to_drive_item_info(item) for item in result.value]
+
+    async def list_items_by_path(self, drive_id: str, path: str) -> list[DriveItemInfo]:
+        """List children of a folder identified by its path relative to the drive root.
+
+        Parameters
+        ----------
+        drive_id:
+            The drive (document library) identifier.
+        path:
+            Path relative to the drive root, e.g. ``"Documents/Reports"``.
+        """
+        # Resolve the folder first, then list children.
+        folder_item = await (
+            self._client.drives.by_drive_id(drive_id)
+            .items.by_drive_item_id(f"root:/{path}:")
+            .get()
+        )
+        if folder_item is None:
+            msg = f"Folder not found at path: {path}"
+            raise FileNotFoundError(msg)
+        return await self.list_items(drive_id, folder_item.id or "root")
+
+    async def get_item(self, drive_id: str, item_id: str) -> DriveItemInfo:
+        """Get metadata for a single drive item.
+
+        Parameters
+        ----------
+        drive_id:
+            The drive (document library) identifier.
+        item_id:
+            The drive item identifier.
+        """
+        item = await (
+            self._client.drives.by_drive_id(drive_id)
+            .items.by_drive_item_id(item_id)
+            .get()
+        )
+        if item is None:
+            msg = f"Item not found: {item_id}"
+            raise FileNotFoundError(msg)
+        return _to_drive_item_info(item)
+
+    async def download_file(
+        self,
+        drive_id: str,
+        item_id: str,
+        destination: str | Path,
+    ) -> Path:
+        """Download a file from OneDrive to the local filesystem.
+
+        Parameters
+        ----------
+        drive_id:
+            The drive (document library) identifier.
+        item_id:
+            The drive item identifier for the file.
+        destination:
+            Local path (file or directory).  If a directory, the remote
+            file name is preserved.
+
+        Returns
+        -------
+        Path
+            The local path of the downloaded file.
+        """
+        destination = Path(destination)
+
+        # If destination is a directory, resolve the filename from Graph.
+        if destination.is_dir():
+            meta = await self.get_item(drive_id, item_id)
+            destination = destination / meta.name
+
+        content: bytes | None = await (
+            self._client.drives.by_drive_id(drive_id)
+            .items.by_drive_item_id(item_id)
+            .content.get()
+        )
+        if content is None:
+            msg = f"No content returned for item {item_id}"
+            raise FileNotFoundError(msg)
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
+        logger.info("Downloaded %s to %s", item_id, destination)
+        return destination
+
+    async def upload_file(
+        self,
+        drive_id: str,
+        parent_folder_id: str,
+        filename: str,
+        content: bytes,
+    ) -> DriveItemInfo:
+        """Upload (or replace) a small file (≤ 250 MB) into a folder.
+
+        Parameters
+        ----------
+        drive_id:
+            The drive (document library) identifier.
+        parent_folder_id:
+            The item ID of the destination folder.
+        filename:
+            The desired filename in OneDrive.
+        content:
+            Raw bytes of the file.
+
+        Returns
+        -------
+        DriveItemInfo
+            Metadata of the newly created / updated drive item.
+        """
+        # Use the Graph SDK to PUT raw bytes at the path-based content endpoint.
+        result: DriveItem | None = await (
+            self._client.drives.by_drive_id(drive_id)
+            .items.by_drive_item_id(f"{parent_folder_id}:/{filename}:")
+            .content.put(content)
+        )
+        if result is None:
+            msg = f"Upload returned no metadata for {filename}"
+            raise RuntimeError(msg)
+        return _to_drive_item_info(result)
+
+    async def upload_file_by_path(
+        self,
+        drive_id: str,
+        remote_path: str,
+        content: bytes,
+    ) -> DriveItemInfo:
+        """Upload (or replace) a file using a path relative to the drive root.
+
+        Parameters
+        ----------
+        drive_id:
+            The drive (document library) identifier.
+        remote_path:
+            Full path relative to root, e.g. ``"Documents/report.pdf"``.
+        content:
+            Raw bytes of the file.
+        """
+        result: DriveItem | None = await (
+            self._client.drives.by_drive_id(drive_id)
+            .items.by_drive_item_id(f"root:/{remote_path}:")
+            .content.put(content)
+        )
+        if result is None:
+            msg = f"Upload returned no metadata for {remote_path}"
+            raise RuntimeError(msg)
+        return _to_drive_item_info(result)
+
+    async def create_folder(
+        self,
+        drive_id: str,
+        parent_folder_id: str,
+        folder_name: str,
+    ) -> DriveItemInfo:
+        """Create a new folder inside a parent folder.
+
+        Parameters
+        ----------
+        drive_id:
+            The drive (document library) identifier.
+        parent_folder_id:
+            Item ID of the parent folder (use ``"root"`` for the drive root).
+        folder_name:
+            Name of the new folder.
+        """
+        new_folder = DriveItem(
+            name=folder_name,
+            folder=Folder(),
+            additional_data={"@microsoft.graph.conflictBehavior": "rename"},
+        )
+        result = await (
+            self._client.drives.by_drive_id(drive_id)
+            .items.by_drive_item_id(parent_folder_id)
+            .children.post(new_folder)
+        )
+        if result is None:
+            msg = f"Folder creation returned no metadata for {folder_name}"
+            raise RuntimeError(msg)
+        return _to_drive_item_info(result)
+
+    async def delete_item(self, drive_id: str, item_id: str) -> None:
+        """Delete a file or folder (moves it to the recycle bin).
+
+        Parameters
+        ----------
+        drive_id:
+            The drive (document library) identifier.
+        item_id:
+            The drive item identifier to delete.
+        """
+        await (
+            self._client.drives.by_drive_id(drive_id)
+            .items.by_drive_item_id(item_id)
+            .delete()
+        )
+        logger.info("Deleted item %s from drive %s", item_id, drive_id)
+
+    async def get_folder_info(
+        self, drive_id: str, folder_id: str = "root"
+    ) -> FolderInfo:
+        """Get folder metadata together with its children.
+
+        Parameters
+        ----------
+        drive_id:
+            The drive (document library) identifier.
+        folder_id:
+            The item ID of the folder.  Use ``"root"`` for the drive root.
+        """
+        folder_meta = await self.get_item(drive_id, folder_id)
+        children = await self.list_items(drive_id, folder_id)
+        return FolderInfo(
+            id=folder_meta.id,
+            name=folder_meta.name,
+            children=children,
+            web_url=folder_meta.web_url,
+        )
+
+
+@lru_cache
+def get_onedrive_client() -> OneDriveClient:
+    """Get a singleton OneDriveClient using DefaultAzureCredential.
+
+    Uses DefaultAzureCredential which tries multiple authentication methods:
+    - Environment variables (AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID)
+    - Managed Identity (when running in Azure)
+    - Azure CLI (az login)
+    - Azure PowerShell
+    - Interactive browser login
+
+    Returns
+    -------
+    OneDriveClient
+        Configured client ready for OneDrive/SharePoint operations.
+    """
+    credential = DefaultAzureCredential()
+    return OneDriveClient(credential=credential)
